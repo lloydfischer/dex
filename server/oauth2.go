@@ -127,6 +127,7 @@ const (
 	grantTypeRefreshToken      = "refresh_token"
 	grantTypePassword          = "password"
 	grantTypeDeviceCode        = "urn:ietf:params:oauth:grant-type:device_code"
+	grantTypeTokenExchange     = "urn:ietf:params:oauth:grant-type:token-exchange"
 )
 
 const (
@@ -280,6 +281,45 @@ type idTokenClaims struct {
 type federatedIDClaims struct {
 	ConnectorID string `json:"connector_id,omitempty"`
 	UserID      string `json:"user_id,omitempty"`
+}
+
+func (s *Server) newExchangeToken(clientID string, claims map[string]interface{}, scopes []string) (exchangeToken string, expiry time.Time, err error) {
+	keys, err := s.storage.GetKeys()
+	if err != nil {
+		s.logger.Errorf("Failed to get keys: %v", err)
+		return "", expiry, err
+	}
+
+	signingKey := keys.SigningKey
+	if signingKey == nil {
+		return "", expiry, fmt.Errorf("no key to sign payload with")
+	}
+	signingAlg, err := signatureAlgorithm(signingKey)
+	if err != nil {
+		return "", expiry, err
+	}
+
+	issuedAt := s.now()
+	expiry = issuedAt.Add(s.idTokensValidFor)
+
+	issuerClaimVal := s.issuerURL.String()
+	expiryClaimVal := expiry.Unix()
+	issuedAtClaimVal := issuedAt.Unix()
+
+	claims["iss"] = issuerClaimVal
+	claims["expiry"] = expiryClaimVal
+	claims["issued_at"] = issuedAtClaimVal
+
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", expiry, fmt.Errorf("could not serialize claims: %v", err)
+	}
+
+	if exchangeToken, err = signPayload(signingKey, signingAlg, payload); err != nil {
+		return "", expiry, fmt.Errorf("failed to sign payload: %v", err)
+	}
+
+	return exchangeToken, expiry, err
 }
 
 func (s *Server) newAccessToken(clientID string, claims storage.Claims, scopes []string, nonce, connID string) (accessToken string, err error) {

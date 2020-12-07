@@ -767,6 +767,128 @@ func TestOAuth2CodeFlow(t *testing.T) {
 	}
 }
 
+const (
+	// tokens from rfc8693. Long expired, of course and not verifiable
+	rfc8693SubjectToken = "eyJhbGciOiJFUzI1NiIsImtpZCI6IjE2In0.eyJhdWQiOiJodHRwczovL2FzLmV4YW1wbGUuY29tIiwiaXNzIjoiaHR0cHM6Ly9vcmlnaW5hbC1pc3N1ZXIuZXhhbXBsZS5uZXQiLCJleHAiOjE0NDE5MTAwNjAsInNjb3BlIjoic3RhdHVzIGZlZWQiLCJzdWIiOiJ1c2VyQGV4YW1wbGUubmV0IiwibWF5X2FjdCI6eyJzdWIiOiJhZG1pbkBleGFtcGxlLm5ldCJ9fQ.4rPRSWihQbpMIgAmAoqaJojAxj-p2X8_fAtAGTXrvMxU-eEZHnXqY0_AOZgLdxw5DyLzua8H_I10MCcckF-Q_g"
+	rfc8693ActorToken   = "eyJhbGciOiJFUzI1NiIsImtpZCI6IjE2In0.eyJhdWQiOiJodHRwczovL2FzLmV4YW1wbGUuY29tIiwiaXNzIjoiaHR0cHM6Ly9vcmlnaW5hbC1pc3N1ZXIuZXhhbXBsZS5uZXQiLCJleHAiOjE0NDE5MTAwNjAsInN1YiI6ImFkbWluQGV4YW1wbGUubmV0In0.7YQ-3zPfhUvzje5oqw8COCvN5uP6NsKik9CVV6cAOf4QKgM-tKfiOwcgZoUuDL2tEs6tqPlcBlMjiSzEjm3yBg"
+	cognitoToken        = "eyJraWQiOiJmODB5XC9vS3RaRHFkeWloNHg2RUFjOEVRTnpwTHptM09iY0NsVkluc0Y5ST0iLCJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIyaXRkbm90cm5wODFlcmNkOGxodTJhbXJubiIsInRva2VuX3VzZSI6ImFjY2VzcyIsInNjb3BlIjoiY3VzdG9tXC9zY29wZSIsImF1dGhfdGltZSI6MTYwNjQ5NDUyNCwiaXNzIjoiaHR0cHM6XC9cL2NvZ25pdG8taWRwLnVzLWVhc3QtMi5hbWF6b25hd3MuY29tXC91cy1lYXN0LTJfNW9OUzRJTGJsIiwiZXhwIjoxNjA2NDk4MTI0LCJpYXQiOjE2MDY0OTQ1MjQsInZlcnNpb24iOjIsImp0aSI6ImU3M2NlYzRmLTlmNjgtNDg1OS1iYzU0LWM4OTllZGRlOWE3MCIsImNsaWVudF9pZCI6IjJpdGRub3RybnA4MWVyY2Q4bGh1MmFtcm5uIn0.AHCQLF0Z4bi5cSVWnjzcZ8PE-nxXPTrqilGVasoXGFs0Mp_B4fcZqFXEs7-_kooBjicC4wfPnCiIyKSK8rKryjH35X6kHxNft5SmDffpRZml0S9WRVESKod0vTm3XsZNsKy9BkgAwnudSZLmSgLFgzPyxZgdcjMQiKhoIucSdKb5KPi7aZCEzhxtLse3it9oKpD29bUcMuOoHnVMXCJ6sXvLVxTd2-PijfXd2rBIFmG4guV_BvJALmZRlpYWUj77bLFJlY3vVjuHeOzLRkWr0HYCT1IK1aksz8Ef4EapRW1hnMhmcm_aF7OZmalf4y6HS6syYNm4gvgiZu9gMQcTAw"
+)
+
+func TestOAuth2TokenExchange(t *testing.T) {
+	ctx := context.Background()
+
+	httpServer, s := newTestServer(ctx, t, func(c *Config) {
+		// Enable support for the implicit flow.
+		//	c.SupportedResponseTypes = []string{"code", "token", "id_token"}
+	})
+	defer httpServer.Close()
+
+	p, err := oidc.NewProvider(ctx, httpServer.URL)
+	if err != nil {
+		t.Fatalf("failed to get provider: %v", err)
+	}
+
+	// a client entitled to Token Exchange
+	client := storage.Client{
+		ID:                 "testclient",
+		Secret:             "testclientsecret",
+		RedirectURIs:       []string{"https://idp.com"},
+		TokenExchange:      true,
+		SubjectTokenIssuer: "https://cognito-idp.us-east-2.amazonaws.com/us-east-2_5oNS4ILbl",
+		ActorTokenIssuer:   "https://cognito-idp.us-east-2.amazonaws.com/us-east-2_5oNS4ILbl",
+	}
+	if err := s.storage.CreateClient(client); err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	v := url.Values{}
+	v.Add("client_id", client.ID)
+	v.Add("client_secret", client.Secret)
+	v.Add("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+	v.Add("subject_token", cognitoToken)
+	v.Add("subject_token_type", "urn:ietf:params:oauth:token-type:jwt")
+	v.Add("actor_token", cognitoToken)
+	v.Add("actor_token_type", "urn:ietf:params:oauth:token-type:jwt")
+	v.Add("resource", "resource 1")
+	v.Add("resource", "resource 2")
+
+	resp, err := http.PostForm(p.Endpoint().TokenURL, v)
+	if err != nil {
+		t.Fatalf("post error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var exchangedToken string
+	if resp.StatusCode == http.StatusOK {
+		_, err := httputil.DumpResponse(resp, true)
+		if err != nil {
+			t.Fatalf("response contains error: %v", err)
+			panic(err)
+		}
+
+		m := make(map[string]interface{})
+		json.NewDecoder(resp.Body).Decode(&m)
+		exchangedToken = m["access_token"].(string)
+
+	} else {
+
+		t.Fatalf("post error: %v", resp.StatusCode)
+	}
+	fmt.Println("first exchange")
+	fmt.Println(exchangedToken)
+
+	// second time throughh, use the result of step 1 as the subject token for step 2
+
+	// another client entitled to Token Exchange
+	client2 := storage.Client{
+		ID:                 "testclient2",
+		Secret:             "testclientsecret",
+		RedirectURIs:       []string{"https://idp.com"},
+		TokenExchange:      true,
+		SubjectTokenIssuer: httpServer.URL,
+		ActorTokenIssuer:   "https://cognito-idp.us-east-2.amazonaws.com/us-east-2_5oNS4ILbl",
+	}
+	if err := s.storage.CreateClient(client2); err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	v = url.Values{}
+	v.Add("client_id", client2.ID)
+	v.Add("client_secret", client2.Secret)
+	v.Add("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+	v.Add("subject_token", exchangedToken)
+	v.Add("subject_token_type", "urn:ietf:params:oauth:token-type:jwt")
+	v.Add("actor_token", cognitoToken)
+	v.Add("actor_token_type", "urn:ietf:params:oauth:token-type:jwt")
+	v.Add("resource", "resource 1")
+	v.Add("resource", "resource 2")
+
+	resp2, err := http.PostForm(p.Endpoint().TokenURL, v)
+	if err != nil {
+		t.Fatalf("post error: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	var exchangedToken2 string
+	if resp2.StatusCode == http.StatusOK {
+		_, err := httputil.DumpResponse(resp2, true)
+		if err != nil {
+			t.Fatalf("response contains error: %v", err)
+			panic(err)
+		}
+
+		m2 := make(map[string]interface{})
+		json.NewDecoder(resp2.Body).Decode(&m2)
+		exchangedToken2 = m2["access_token"].(string)
+
+	} else {
+
+		t.Fatalf("post error: %v", resp2.StatusCode)
+	}
+	fmt.Println("second exchange")
+	fmt.Println(exchangedToken2)
+}
+
 func TestOAuth2ImplicitFlow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

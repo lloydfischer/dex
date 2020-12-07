@@ -156,6 +156,15 @@ type Client struct {
 	// Name and LogoURL used when displaying this client to the end user.
 	Name    string `json:"name" yaml:"name"`
 	LogoURL string `json:"logoURL" yaml:"logoURL"`
+
+	// if true, the client is allowed to use the Token Exchange grant type
+	TokenExchange bool `json:"tokenExchange" yaml:"tokenExchange"`
+
+	// Token exchange client must declare the issuer of the subject token
+	SubjectTokenIssuer string `json:"subjectTokenIssuer" yaml:"subjectTokenIssuer"`
+
+	// optional - is the actor token issuer is not the same as the subject token issuer it must be declared here
+	ActorTokenIssuer string `json:"actorTokenIssuer" yaml:"actorTokenIssuer"`
 }
 
 // Claims represents the ID Token claims supported by the server.

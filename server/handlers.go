@@ -783,6 +783,8 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		s.handleRefreshToken(w, r, client)
 	case grantTypePassword:
 		s.handlePasswordGrant(w, r, client)
+	case grantTypeTokenExchange:
+		s.handleTokenExchange(w, r, client)
 	default:
 		s.tokenErrHelper(w, errInvalidGrant, "", http.StatusBadRequest)
 	}
@@ -798,6 +800,144 @@ func (s *Server) calculateCodeChallenge(codeVerifier, codeChallengeMethod string
 	default:
 		return "", fmt.Errorf("unknown challenge method (%v)", codeChallengeMethod)
 	}
+}
+
+// handle a token exchange request https://tools.ietf.org/html/rfc8693
+func (s *Server) handleTokenExchange(w http.ResponseWriter, r *http.Request, client storage.Client) {
+
+	if !client.TokenExchange {
+		s.tokenErrHelper(w, errInvalidClient, "Client not authorized for Token Exchange.", http.StatusUnauthorized)
+		return
+	}
+
+	// subject token is required
+	subjectToken := r.PostFormValue("subject_token")
+	subjectTokenType := r.PostFormValue("subject_token_type")
+
+	if subjectToken == "" || subjectTokenType == "" {
+		s.tokenErrHelper(w, errInvalidRequest, "Missing subject token or subject token type", http.StatusBadRequest)
+	}
+
+	var subjectClaims map[string]interface{}
+
+	err := verifyAndGetClaims(client.SubjectTokenIssuer, subjectToken, &subjectClaims)
+	if err != nil {
+		// TODO if we can't verify, should explain why
+		panic(err)
+	}
+
+	// actor token is optional, but if it is provided the token type is required
+	// if the token is not provided then the type may not be provided
+	actorToken := r.PostFormValue("actor_token")
+	actorTokenType := r.PostFormValue("actor_token_type")
+
+	haveActorToken := actorToken != ""
+	haveActorTokenType := actorTokenType != ""
+
+	if haveActorToken != haveActorTokenType {
+		s.tokenErrHelper(w, errInvalidRequest, "Actor token and Actor Token Type mis-match", http.StatusBadRequest)
+	}
+
+	var actorClaims map[string]interface{}
+
+	// TODO (lloydfischer) support descoping semantics later
+	if !haveActorToken {
+		s.tokenErrHelper(w, errInvalidRequest, "Actor token requred for delegation", http.StatusBadRequest)
+	}
+
+	// delegation semantics
+	err = verifyAndGetClaims(client.ActorTokenIssuer, actorToken, &actorClaims)
+	if err != nil {
+		// if we can't verify, explain why
+		panic(err)
+	}
+	if actorClaims["act"] != nil {
+		s.tokenErrHelper(w, errInvalidRequest, "Actor token cannot contain an act claim.", http.StatusBadRequest)
+	}
+
+	// shallow copy the actor claims
+	actorTokenCloneClaims := make(map[string]interface{})
+	for key, value := range actorClaims {
+		actorTokenCloneClaims[key] = value
+	}
+
+	// shallow copy the subject, except any existing act claim
+	mergeClaims := make(map[string]interface{})
+	for key, value := range subjectClaims {
+		if key != "act" {
+			mergeClaims[key] = value
+		}
+	}
+
+	// add the actor token as the main actor of the subject
+	mergeClaims["act"] = actorTokenCloneClaims
+
+	// if the subject previously has an act claim add it to the new act claim we just created
+	subjectActClaim := subjectClaims["act"]
+	if subjectActClaim != nil {
+
+		actorTokenCloneClaims["act"] = subjectActClaim
+	}
+
+	// scope and requested token type are optional
+	scope := r.PostFormValue("scope")
+	if scope != "" {
+		//TODO process scope
+	}
+	requestedTokenType := r.PostFormValue("requested_token_type")
+	if requestedTokenType != "" {
+		//TODO process requested token type
+	}
+
+	// resource and audience are optional and may be provided more than once
+	resource := r.Form["resource"]
+	if resource != nil {
+		// TODO process resources
+	}
+	audience := r.Form["audience"]
+	if audience != nil {
+		// TODO process audience
+	}
+
+	var scopes []string
+
+	token, expiry, err := s.newExchangeToken(client.ID, mergeClaims, scopes)
+
+	response := s.toTokenExchangeReponse(token, expiry)
+	s.writeExchangeToken(w, response)
+
+}
+
+func verifyAndGetClaims(issuer string, token string, dest *map[string]interface{}) error {
+
+	ctx := context.Background()
+	p, err := oidc.NewProvider(ctx, issuer)
+	if err != nil {
+		return err
+	}
+	cfg := oidc.Config{
+		SkipClientIDCheck: true,
+		//SkipIssuerCheck:   true,
+		SkipExpiryCheck: true,
+	}
+
+	_, err = p.Verifier(&cfg).Verify(ctx, token)
+	if err != nil {
+		return err
+	}
+
+	// all verified at this point
+	// go back and get the raw claims
+
+	splits := strings.Split(token, ".")
+	decodedPayload, err := base64.RawURLEncoding.DecodeString(splits[1])
+	err = json.Unmarshal(decodedPayload, dest)
+	if err != nil {
+		return err
+	}
+
+	return nil
+
 }
 
 // handle an access token request https://tools.ietf.org/html/rfc6749#section-4.1.3
@@ -1457,6 +1597,24 @@ type accessTokenReponse struct {
 	IDToken      string `json:"id_token"`
 }
 
+type tokenExchangeReponse struct {
+	AccessToken     string `json:"access_token"`
+	IssuedTokenType string `json:"issued_token_type"`
+	TokenType       string `json:"token_type"`
+	ExpiresIn       int    `json:"expires_in"`
+	RefreshToken    string `json:"refresh_token,omitempty"`
+}
+
+func (s *Server) toTokenExchangeReponse(accessToken string, expiry time.Time) *tokenExchangeReponse {
+	return &tokenExchangeReponse{
+		accessToken,
+		"urn:ietf:params:oauth:token-type:jwt",
+		"bearer",
+		int(expiry.Sub(s.now()).Seconds()),
+		"",
+	}
+}
+
 func (s *Server) toAccessTokenResponse(idToken, accessToken, refreshToken string, expiry time.Time) *accessTokenReponse {
 	return &accessTokenReponse{
 		accessToken,
@@ -1471,6 +1629,18 @@ func (s *Server) writeAccessToken(w http.ResponseWriter, resp *accessTokenRepons
 	data, err := json.Marshal(resp)
 	if err != nil {
 		s.logger.Errorf("failed to marshal access token response: %v", err)
+		s.tokenErrHelper(w, errServerError, "", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Write(data)
+}
+
+func (s *Server) writeExchangeToken(w http.ResponseWriter, resp *tokenExchangeReponse) {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		s.logger.Errorf("failed to marshal accexchangeess token response: %v", err)
 		s.tokenErrHelper(w, errServerError, "", http.StatusInternalServerError)
 		return
 	}
